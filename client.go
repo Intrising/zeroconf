@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/cenkalti/backoff"
-	"github.com/miekg/dns"
+	"github.com/Intrising/backoff"
+	"github.com/Intrising/dns"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
