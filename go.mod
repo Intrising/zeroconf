@@ -1,6 +1,6 @@
-module github.com/grandcat/zeroconf
+module github.com/Intrising/zeroconf
 
-go 1.13
+go 1.19
 
 require (
 	github.com/Intrising/dns v1.1.41
