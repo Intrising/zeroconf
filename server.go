@@ -296,45 +296,36 @@ func (s *Server) parsePacket(packet []byte, ifIndex int, from net.Addr) error {
 
 // handleQuery is used to handle an incoming query
 func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
-	// Ignore questions with authoritative section for now
-	if len(query.Ns) > 0 {
-		return nil
-	}
-
-	// Handle each question
-	var err error
-	for _, q := range query.Question {
-		resp := dns.Msg{}
-		resp.SetReply(query)
-		resp.Compress = true
-		resp.RecursionDesired = false
-		resp.Authoritative = true
-		resp.Question = nil // RFC6762 section 6 "responses MUST NOT contain any questions"
-		resp.Answer = []dns.RR{}
-		resp.Extra = []dns.RR{}
-		if err = s.handleQuestion(q, &resp, query, ifIndex); err != nil {
-			// log.Printf("[ERR] zeroconf: failed to handle question %v: %v", q, err)
-			continue
-		}
-		// Check if there is an answer
-		if len(resp.Answer) == 0 {
-			continue
-		}
-
-		if isUnicastQuestion(q) {
-			// Send unicast
-			if e := s.unicastResponse(&resp, ifIndex, from); e != nil {
-				err = e
-			}
-		} else {
-			// Send mulicast
-			if e := s.multicastResponse(&resp, ifIndex); e != nil {
-				err = e
-			}
-		}
-	}
-
-	return err
+    if len(query.Ns) > 0 {
+        return nil
+    }
+    var err error
+    for _, q := range query.Question {
+        resp := dns.Msg{}
+        resp.SetReply(query)
+        resp.Compress = true
+        resp.RecursionDesired = false
+        resp.Authoritative = true
+        resp.Question = nil
+        resp.Answer = []dns.RR{}
+        resp.Extra = []dns.RR{}
+        if err = s.handleQuestion(q, &resp, query, from); err != nil {
+            continue
+        }
+        if len(resp.Answer) == 0 {
+            continue
+        }
+        if isUnicastQuestion(q) {
+            if e := s.unicastResponse(&resp, ifIndex, from); e != nil {
+                err = e
+            }
+        } else {
+            if e := s.multicastResponse(&resp, ifIndex); e != nil {
+                err = e
+            }
+        }
+    }
+    return err
 }
 
 // RFC6762 7.1. Known-Answer Suppression
@@ -364,163 +355,141 @@ func isKnownAnswer(resp *dns.Msg, query *dns.Msg) bool {
 }
 
 // handleQuestion is used to handle an incoming question
-func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, ifIndex int) error {
-	if s.service == nil {
-		return nil
-	}
-
-	switch q.Name {
-	case s.service.ServiceTypeName():
-		s.serviceTypeName(resp, s.ttl)
-		if isKnownAnswer(resp, query) {
-			resp.Answer = nil
-		}
-
-	case s.service.ServiceName():
-		s.composeBrowsingAnswers(resp, ifIndex)
-		if isKnownAnswer(resp, query) {
-			resp.Answer = nil
-		}
-
-	case s.service.ServiceInstanceName():
-		s.composeLookupAnswers(resp, s.ttl, ifIndex, false)
-	default:
-		// handle matching subtype query
-		for _, subtype := range s.service.Subtypes {
-			subtype = fmt.Sprintf("%s._sub.%s", subtype, s.service.ServiceName())
-			if q.Name == subtype {
-				s.composeBrowsingAnswers(resp, ifIndex)
-				if isKnownAnswer(resp, query) {
-					resp.Answer = nil
-				}
-				break
-			}
-		}
-	}
-
-	return nil
+func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, from net.Addr) error {
+    if s.service == nil {
+        return nil
+    }
+    switch q.Name {
+    case s.service.ServiceTypeName():
+        s.serviceTypeName(resp, s.ttl, from)
+        if isKnownAnswer(resp, query) {
+            resp.Answer = nil
+        }
+    case s.service.ServiceName():
+        s.composeBrowsingAnswers(resp, from)
+        if isKnownAnswer(resp, query) {
+            resp.Answer = nil
+        }
+    case s.service.ServiceInstanceName():
+        s.composeLookupAnswers(resp, s.ttl, from, false)
+    default:
+        for _, subtype := range s.service.Subtypes {
+            subtype = fmt.Sprintf("%s._sub.%s", subtype, s.service.ServiceName())
+            if q.Name == subtype {
+                s.composeBrowsingAnswers(resp, from)
+                if isKnownAnswer(resp, query) {
+                    resp.Answer = nil
+                }
+                break
+            }
+        }
+    }
+    return nil
 }
 
-func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ifIndex int) {
-	ptr := &dns.PTR{
-		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceName(),
-			Rrtype: dns.TypePTR,
-			Class:  dns.ClassINET,
-			Ttl:    s.ttl,
-		},
-		Ptr: s.service.ServiceInstanceName(),
-	}
-	resp.Answer = append(resp.Answer, ptr)
-
-	txt := &dns.TXT{
-		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceInstanceName(),
-			Rrtype: dns.TypeTXT,
-			Class:  dns.ClassINET,
-			Ttl:    s.ttl,
-		},
-		Txt: s.service.Text,
-	}
-	srv := &dns.SRV{
-		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceInstanceName(),
-			Rrtype: dns.TypeSRV,
-			Class:  dns.ClassINET,
-			Ttl:    s.ttl,
-		},
-		Priority: 0,
-		Weight:   0,
-		Port:     uint16(s.service.Port),
-		Target:   s.service.HostName,
-	}
-	resp.Extra = append(resp.Extra, srv, txt)
-
-	resp.Extra = s.appendAddrs(resp.Extra, s.ttl, ifIndex, false)
+func (s *Server) composeBrowsingAnswers(resp *dns.Msg, from net.Addr) {
+    ptr := &dns.PTR{
+        Hdr: dns.RR_Header{
+            Name:   s.service.ServiceName(),
+            Rrtype: dns.TypePTR,
+            Class:  dns.ClassINET,
+            Ttl:    s.ttl,
+        },
+        Ptr: s.service.ServiceInstanceName(),
+    }
+    resp.Answer = append(resp.Answer, ptr)
+    txt := &dns.TXT{
+        Hdr: dns.RR_Header{
+            Name:   s.service.ServiceInstanceName(),
+            Rrtype: dns.TypeTXT,
+            Class:  dns.ClassINET,
+            Ttl:    s.ttl,
+        },
+        Txt: s.service.Text,
+    }
+    srv := &dns.SRV{
+        Hdr: dns.RR_Header{
+            Name:   s.service.ServiceInstanceName(),
+            Rrtype: dns.TypeSRV,
+            Class:  dns.ClassINET,
+            Ttl:    s.ttl,
+        },
+        Priority: 0,
+        Weight:   0,
+        Port:     uint16(s.service.Port),
+        Target:   s.service.HostName,
+    }
+    resp.Extra = append(resp.Extra, srv, txt)
+    resp.Extra = s.appendAddrs(resp.Extra, s.ttl, from, false)
 }
 
-func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, ifIndex int, flushCache bool) {
-	// From RFC6762
-	//    The most significant bit of the rrclass for a record in the Answer
-	//    Section of a response message is the Multicast DNS cache-flush bit
-	//    and is discussed in more detail below in Section 10.2, "Announcements
-	//    to Flush Outdated Cache Entries".
-	ptr := &dns.PTR{
-		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceName(),
-			Rrtype: dns.TypePTR,
-			Class:  dns.ClassINET,
-			Ttl:    ttl,
-		},
-		Ptr: s.service.ServiceInstanceName(),
-	}
-	srv := &dns.SRV{
-		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceInstanceName(),
-			Rrtype: dns.TypeSRV,
-			Class:  dns.ClassINET | qClassCacheFlush,
-			Ttl:    ttl,
-		},
-		Priority: 0,
-		Weight:   0,
-		Port:     uint16(s.service.Port),
-		Target:   s.service.HostName,
-	}
-	txt := &dns.TXT{
-		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceInstanceName(),
-			Rrtype: dns.TypeTXT,
-			Class:  dns.ClassINET | qClassCacheFlush,
-			Ttl:    ttl,
-		},
-		Txt: s.service.Text,
-	}
-	dnssd := &dns.PTR{
-		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceTypeName(),
-			Rrtype: dns.TypePTR,
-			Class:  dns.ClassINET,
-			Ttl:    ttl,
-		},
-		Ptr: s.service.ServiceName(),
-	}
-	resp.Answer = append(resp.Answer, srv, txt, ptr, dnssd)
-
-	for _, subtype := range s.service.Subtypes {
-		resp.Answer = append(resp.Answer,
-			&dns.PTR{
-				Hdr: dns.RR_Header{
-					Name:   subtype,
-					Rrtype: dns.TypePTR,
-					Class:  dns.ClassINET,
-					Ttl:    ttl,
-				},
-				Ptr: s.service.ServiceInstanceName(),
-			})
-	}
-
-	resp.Answer = s.appendAddrs(resp.Answer, ttl, ifIndex, flushCache)
+func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, from net.Addr, flushCache bool) {
+    ptr := &dns.PTR{
+        Hdr: dns.RR_Header{
+            Name:   s.service.ServiceName(),
+            Rrtype: dns.TypePTR,
+            Class:  dns.ClassINET,
+            Ttl:    ttl,
+        },
+        Ptr: s.service.ServiceInstanceName(),
+    }
+    srv := &dns.SRV{
+        Hdr: dns.RR_Header{
+            Name:   s.service.ServiceInstanceName(),
+            Rrtype: dns.TypeSRV,
+            Class:  dns.ClassINET | qClassCacheFlush,
+            Ttl:    ttl,
+        },
+        Priority: 0,
+        Weight:   0,
+        Port:     uint16(s.service.Port),
+        Target:   s.service.HostName,
+    }
+    txt := &dns.TXT{
+        Hdr: dns.RR_Header{
+            Name:   s.service.ServiceInstanceName(),
+            Rrtype: dns.TypeTXT,
+            Class:  dns.ClassINET | qClassCacheFlush,
+            Ttl:    ttl,
+        },
+        Txt: s.service.Text,
+    }
+    dnssd := &dns.PTR{
+        Hdr: dns.RR_Header{
+            Name:   s.service.ServiceTypeName(),
+            Rrtype: dns.TypePTR,
+            Class:  dns.ClassINET,
+            Ttl:    ttl,
+        },
+        Ptr: s.service.ServiceName(),
+    }
+    resp.Answer = append(resp.Answer, srv, txt, ptr, dnssd)
+    for _, subtype := range s.service.Subtypes {
+        resp.Answer = append(resp.Answer,
+            &dns.PTR{
+                Hdr: dns.RR_Header{
+                    Name:   subtype,
+                    Rrtype: dns.TypePTR,
+                    Class:  dns.ClassINET,
+                    Ttl:    ttl,
+                },
+                Ptr: s.service.ServiceInstanceName(),
+            })
+    }
+    resp.Answer = s.appendAddrs(resp.Answer, ttl, from, flushCache)
 }
 
-func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32) {
-	// From RFC6762
-	// 9.  Service Type Enumeration
-	//
-	//    For this purpose, a special meta-query is defined.  A DNS query for
-	//    PTR records with the name "_services._dns-sd._udp.<Domain>" yields a
-	//    set of PTR records, where the rdata of each PTR record is the two-
-	//    label <Service> name, plus the same domain, e.g.,
-	//    "_http._tcp.<Domain>".
-	dnssd := &dns.PTR{
-		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceTypeName(),
-			Rrtype: dns.TypePTR,
-			Class:  dns.ClassINET,
-			Ttl:    ttl,
-		},
-		Ptr: s.service.ServiceName(),
-	}
-	resp.Answer = append(resp.Answer, dnssd)
+func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32, from net.Addr) {
+    dnssd := &dns.PTR{
+        Hdr: dns.RR_Header{
+            Name:   s.service.ServiceTypeName(),
+            Rrtype: dns.TypePTR,
+            Class:  dns.ClassINET,
+            Ttl:    ttl,
+        },
+        Ptr: s.service.ServiceName(),
+    }
+    resp.Answer = append(resp.Answer, dnssd)
 }
 
 // Perform probing & announcement
@@ -577,7 +546,7 @@ func (s *Server) probe() {
 			resp.Compress = true
 			resp.Answer = []dns.RR{}
 			resp.Extra = []dns.RR{}
-			s.composeLookupAnswers(resp, s.ttl, intf.Index, true)
+			s.composeLookupAnswers(resp, s.ttl, nil, true)
 			if err := s.multicastResponse(resp, intf.Index); err != nil {
 				log.Println("[ERR] zeroconf: failed to send announcement:", err.Error())
 			}
@@ -601,8 +570,7 @@ func (s *Server) announceText() {
 		},
 		Txt: s.service.Text,
 	}
-
-	resp.Answer = []dns.RR{txt}
+	resp.Answer = s.appendAddrs([]dns.RR{txt}, s.ttl, nil, true)
 	s.multicastResponse(resp, 0)
 }
 
@@ -611,56 +579,103 @@ func (s *Server) unregister() error {
 	resp.MsgHdr.Response = true
 	resp.Answer = []dns.RR{}
 	resp.Extra = []dns.RR{}
-	s.composeLookupAnswers(resp, 0, 0, true)
+	s.composeLookupAnswers(resp, 0, nil, true)
 	return s.multicastResponse(resp, 0)
 }
 
-func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, flushCache bool) []dns.RR {
-	v4 := s.service.AddrIPv4
-	v6 := s.service.AddrIPv6
-	if len(v4) == 0 && len(v6) == 0 {
-		iface, _ := net.InterfaceByIndex(ifIndex)
-		if iface != nil {
-			a4, a6 := addrsForInterface(iface)
-			v4 = append(v4, a4...)
-			v6 = append(v6, a6...)
-		}
-	}
-	if ttl > 0 {
-		// RFC6762 Section 10 says A/AAAA records SHOULD
-		// use TTL of 120s, to account for network interface
-		// and IP address changes.
-		ttl = 120
-	}
-	var cacheFlushBit uint16
-	if flushCache {
-		cacheFlushBit = qClassCacheFlush
-	}
-	for _, ipv4 := range v4 {
-		a := &dns.A{
-			Hdr: dns.RR_Header{
-				Name:   s.service.HostName,
-				Rrtype: dns.TypeA,
-				Class:  dns.ClassINET | cacheFlushBit,
-				Ttl:    ttl,
-			},
-			A: ipv4,
-		}
-		list = append(list, a)
-	}
-	for _, ipv6 := range v6 {
-		aaaa := &dns.AAAA{
-			Hdr: dns.RR_Header{
-				Name:   s.service.HostName,
-				Rrtype: dns.TypeAAAA,
-				Class:  dns.ClassINET | cacheFlushBit,
-				Ttl:    ttl,
-			},
-			AAAA: ipv6,
-		}
-		list = append(list, aaaa)
-	}
-	return list
+func (s *Server) appendAddrs(list []dns.RR, ttl uint32, from net.Addr, flushCache bool) []dns.RR {
+    var v4, v6 []net.IP
+
+    // If no source address is provided, fall back to all pre-populated IPs
+    if from == nil {
+        v4 = s.service.AddrIPv4
+        v6 = s.service.AddrIPv6
+        if len(v4) == 0 && len(v6) == 0 {
+            for _, iface := range s.ifaces {
+                a4, a6 := addrsForInterface(&iface)
+                v4 = append(v4, a4...)
+                v6 = append(v6, a6...)
+            }
+        }
+    } else {
+        // Extract the source IP from the incoming packet
+        var srcIP net.IP
+        if udpAddr, ok := from.(*net.UDPAddr); ok {
+            srcIP = udpAddr.IP
+        }
+
+        // If we have a source IP, find the interface with a matching IP or subnet
+        if srcIP != nil {
+            interfaces, err := net.Interfaces()
+            if err == nil {
+                for _, iface := range interfaces {
+                    // Skip down or non-multicast interfaces
+                    if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 {
+                        continue
+                    }
+                    addrs, err := iface.Addrs()
+                    if err != nil {
+                        continue
+                    }
+                    for _, addr := range addrs {
+                        if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
+                            // Check if the source IP is in the same subnet or matches the interface IP
+                            if ipNet.Contains(srcIP) || ipNet.IP.Equal(srcIP) {
+                                // Add only this interface's IPs
+                                a4, a6 := addrsForInterface(&iface)
+                                v4 = append(v4, a4...)
+                                v6 = append(v6, a6...)
+                                break
+                            }
+                        }
+                    }
+                    if len(v4) > 0 || len(v6) > 0 {
+                        break
+                    }
+                }
+            }
+        }
+
+        // If no matching interface was found, fall back to pre-populated IPs
+        if len(v4) == 0 && len(v6) == 0 {
+            v4 = s.service.AddrIPv4
+            v6 = s.service.AddrIPv6
+        }
+    }
+
+    if ttl > 0 {
+        // RFC6762 Section 10 says A/AAAA records SHOULD use TTL of 120s
+        ttl = 120
+    }
+    var cacheFlushBit uint16
+    if flushCache {
+        cacheFlushBit = qClassCacheFlush
+    }
+    for _, ipv4 := range v4 {
+        a := &dns.A{
+            Hdr: dns.RR_Header{
+                Name:   s.service.HostName,
+                Rrtype: dns.TypeA,
+                Class:  dns.ClassINET | cacheFlushBit,
+                Ttl:    ttl,
+            },
+            A: ipv4, // Fix: Use the actual IPv4 address
+        }
+        list = append(list, a)
+    }
+    for _, ipv6 := range v6 {
+        aaaa := &dns.AAAA{
+            Hdr: dns.RR_Header{
+                Name:   s.service.HostName,
+                Rrtype: dns.TypeAAAA,
+                Class:  dns.ClassINET | cacheFlushBit,
+                Ttl:    ttl,
+            },
+            AAAA: ipv6,
+        }
+        list = append(list, aaaa)
+    }
+    return list
 }
 
 func addrsForInterface(iface *net.Interface) ([]net.IP, []net.IP) {
@@ -716,36 +731,35 @@ func (s *Server) unicastResponse(resp *dns.Msg, ifIndex int, from net.Addr) erro
 
 // multicastResponse us used to send a multicast response packet
 func (s *Server) multicastResponse(msg *dns.Msg, ifIndex int) error {
-	buf, err := msg.Pack()
-	if err != nil {
-		return err
-	}
-	if s.ipv4conn != nil {
-		var wcm ipv4.ControlMessage
-		if ifIndex != 0 {
-			wcm.IfIndex = ifIndex
-			s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
-		} else {
-			for _, intf := range s.ifaces {
-				wcm.IfIndex = intf.Index
-				s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
-			}
-		}
-	}
-
-	if s.ipv6conn != nil {
-		var wcm ipv6.ControlMessage
-		if ifIndex != 0 {
-			wcm.IfIndex = ifIndex
-			s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
-		} else {
-			for _, intf := range s.ifaces {
-				wcm.IfIndex = intf.Index
-				s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
-			}
-		}
-	}
-	return nil
+    buf, err := msg.Pack()
+    if err != nil {
+        return err
+    }
+    if s.ipv4conn != nil {
+        var wcm ipv4.ControlMessage
+        if ifIndex != 0 {
+            wcm.IfIndex = ifIndex
+            s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
+        } else {
+            for _, intf := range s.ifaces {
+                wcm.IfIndex = intf.Index
+                s.ipv4conn.WriteTo(buf, &wcm, ipv4Addr)
+            }
+        }
+    }
+    if s.ipv6conn != nil {
+        var wcm ipv6.ControlMessage
+        if ifIndex != 0 {
+            wcm.IfIndex = ifIndex
+            s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
+        } else {
+            for _, intf := range s.ifaces {
+                wcm.IfIndex = intf.Index
+                s.ipv6conn.WriteTo(buf, &wcm, ipv6Addr)
+            }
+        }
+    }
+    return nil
 }
 
 func isUnicastQuestion(q dns.Question) bool {
