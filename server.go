@@ -140,12 +140,21 @@ const (
 	qClassCacheFlush uint16 = 1 << 15
 )
 
+// ifaceAddrCache stores cached addresses for an interface
+type ifaceAddrCache struct {
+	iface *net.Interface
+	addrs []net.Addr
+	v4    []net.IP
+	v6    []net.IP
+}
+
 // Server structure encapsulates both IPv4/IPv6 UDP connections
 type Server struct {
-	service  *ServiceEntry
-	ipv4conn *ipv4.PacketConn
-	ipv6conn *ipv6.PacketConn
-	ifaces   []net.Interface
+	service    *ServiceEntry
+	ipv4conn   *ipv4.PacketConn
+	ipv6conn   *ipv6.PacketConn
+	ifaces     []net.Interface
+	ifaceAddrs []ifaceAddrCache // cached interface addresses
 
 	shouldShutdown chan struct{}
 	shutdownLock   sync.Mutex
@@ -169,10 +178,32 @@ func newServer(ifaces []net.Interface) (*Server, error) {
 		return nil, fmt.Errorf("no supported interface")
 	}
 
+	// Pre-cache interface addresses to avoid expensive syscalls on every query
+	ifaceAddrs := make([]ifaceAddrCache, 0, len(ifaces))
+	for i := range ifaces {
+		iface := &ifaces[i]
+		// Skip down or non-multicast interfaces
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		v4, v6 := addrsForInterface(iface)
+		ifaceAddrs = append(ifaceAddrs, ifaceAddrCache{
+			iface: iface,
+			addrs: addrs,
+			v4:    v4,
+			v6:    v6,
+		})
+	}
+
 	s := &Server{
 		ipv4conn:       ipv4conn,
 		ipv6conn:       ipv6conn,
 		ifaces:         ifaces,
+		ifaceAddrs:     ifaceAddrs,
 		ttl:            3200,
 		shouldShutdown: make(chan struct{}),
 	}
@@ -591,10 +622,10 @@ func (s *Server) appendAddrs(list []dns.RR, ttl uint32, from net.Addr, flushCach
         v4 = s.service.AddrIPv4
         v6 = s.service.AddrIPv6
         if len(v4) == 0 && len(v6) == 0 {
-            for _, iface := range s.ifaces {
-                a4, a6 := addrsForInterface(&iface)
-                v4 = append(v4, a4...)
-                v6 = append(v6, a6...)
+            // Use cached interface addresses
+            for _, cache := range s.ifaceAddrs {
+                v4 = append(v4, cache.v4...)
+                v6 = append(v6, cache.v6...)
             }
         }
     } else {
@@ -605,33 +636,22 @@ func (s *Server) appendAddrs(list []dns.RR, ttl uint32, from net.Addr, flushCach
         }
 
         // If we have a source IP, find the interface with a matching IP or subnet
+        // Use cached s.ifaceAddrs to avoid expensive syscalls on every query
         if srcIP != nil {
-            interfaces, err := net.Interfaces()
-            if err == nil {
-                for _, iface := range interfaces {
-                    // Skip down or non-multicast interfaces
-                    if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 {
-                        continue
-                    }
-                    addrs, err := iface.Addrs()
-                    if err != nil {
-                        continue
-                    }
-                    for _, addr := range addrs {
-                        if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
-                            // Check if the source IP is in the same subnet or matches the interface IP
-                            if ipNet.Contains(srcIP) || ipNet.IP.Equal(srcIP) {
-                                // Add only this interface's IPs
-                                a4, a6 := addrsForInterface(&iface)
-                                v4 = append(v4, a4...)
-                                v6 = append(v6, a6...)
-                                break
-                            }
+            for _, cache := range s.ifaceAddrs {
+                for _, addr := range cache.addrs {
+                    if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
+                        // Check if the source IP is in the same subnet or matches the interface IP
+                        if ipNet.Contains(srcIP) || ipNet.IP.Equal(srcIP) {
+                            // Use cached IPs instead of calling addrsForInterface
+                            v4 = append(v4, cache.v4...)
+                            v6 = append(v6, cache.v6...)
+                            break
                         }
                     }
-                    if len(v4) > 0 || len(v6) > 0 {
-                        break
-                    }
+                }
+                if len(v4) > 0 || len(v6) > 0 {
+                    break
                 }
             }
         }
