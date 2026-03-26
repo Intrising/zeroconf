@@ -161,6 +161,11 @@ type Server struct {
 	shutdownEnd    sync.WaitGroup
 	isShutdown     bool
 	ttl            uint32
+
+	// Rate limiting for mDNS packets
+	rateLimitCount int64
+	rateLimitTime  time.Time
+	rateLimitMu    sync.Mutex
 }
 
 // Constructs server structure
@@ -317,6 +322,34 @@ func (s *Server) recv6(c *ipv6.PacketConn) {
 
 // parsePacket is used to parse an incoming packet
 func (s *Server) parsePacket(packet []byte, ifIndex int, from net.Addr) error {
+	// Rate limiting: max 256 packets per second
+	const maxPacketsPerSecond = 256
+	s.rateLimitMu.Lock()
+	now := time.Now()
+	if now.Sub(s.rateLimitTime) >= time.Second {
+		s.rateLimitCount = 0
+		s.rateLimitTime = now
+	}
+	s.rateLimitCount++
+	if s.rateLimitCount > maxPacketsPerSecond {
+		s.rateLimitMu.Unlock()
+		return errors.New("rate limit exceeded")
+	}
+	s.rateLimitMu.Unlock()
+
+	// Validate DNS header to reject malformed packets with abnormal record counts.
+	// DNS header: bytes 4-5 = QDCOUNT, 6-7 = ANCOUNT, 8-9 = NSCOUNT, 10-11 = ARCOUNT
+	const maxRecords = 256 // reasonable limit for mDNS packets
+	if len(packet) >= 12 {
+		qdcount := int(packet[4])<<8 | int(packet[5])
+		ancount := int(packet[6])<<8 | int(packet[7])
+		nscount := int(packet[8])<<8 | int(packet[9])
+		arcount := int(packet[10])<<8 | int(packet[11])
+		if qdcount > maxRecords || ancount > maxRecords || nscount > maxRecords || arcount > maxRecords {
+			return errors.New("malformed DNS packet: record count exceeds limit")
+		}
+	}
+
 	var msg dns.Msg
 	if err := msg.Unpack(packet); err != nil {
 		// log.Printf("[ERR] zeroconf: Failed to unpack packet: %v", err)
