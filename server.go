@@ -322,8 +322,8 @@ func (s *Server) recv6(c *ipv6.PacketConn) {
 
 // parsePacket is used to parse an incoming packet
 func (s *Server) parsePacket(packet []byte, ifIndex int, from net.Addr) error {
-	// Rate limiting: max 100 packets per second
-	const maxPacketsPerSecond = 100
+	// Rate limiting: max 256 packets per second
+	const maxPacketsPerSecond = 256
 	s.rateLimitMu.Lock()
 	now := time.Now()
 	if now.Sub(s.rateLimitTime) >= time.Second {
