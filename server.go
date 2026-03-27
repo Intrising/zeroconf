@@ -166,6 +166,10 @@ type Server struct {
 	rateLimitCount int64
 	rateLimitTime  time.Time
 	rateLimitMu    sync.Mutex
+
+	// Packet deduplication to avoid processing same multicast packet from multiple interfaces
+	seenPackets   map[uint64]time.Time
+	seenPacketsMu sync.Mutex
 }
 
 // Constructs server structure
@@ -211,6 +215,7 @@ func newServer(ifaces []net.Interface) (*Server, error) {
 		ifaceAddrs:     ifaceAddrs,
 		ttl:            3200,
 		shouldShutdown: make(chan struct{}),
+		seenPackets:    make(map[uint64]time.Time),
 	}
 
 	return s, nil
@@ -320,12 +325,45 @@ func (s *Server) recv6(c *ipv6.PacketConn) {
 	}
 }
 
+// packetHash computes a simple FNV-1a hash for packet deduplication
+func packetHash(packet []byte) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	for _, b := range packet {
+		h ^= uint64(b)
+		h *= prime64
+	}
+	return h
+}
+
 // parsePacket is used to parse an incoming packet
 func (s *Server) parsePacket(packet []byte, ifIndex int, from net.Addr) error {
+	now := time.Now()
+
+	// Packet deduplication: same multicast packet received on multiple interfaces
+	hash := packetHash(packet)
+	s.seenPacketsMu.Lock()
+	if lastSeen, exists := s.seenPackets[hash]; exists && now.Sub(lastSeen) < 500*time.Millisecond {
+		s.seenPacketsMu.Unlock()
+		return nil // duplicate packet, skip
+	}
+	s.seenPackets[hash] = now
+	// Clean up old entries (keep map size bounded)
+	if len(s.seenPackets) > 1000 {
+		for k, t := range s.seenPackets {
+			if now.Sub(t) > time.Second {
+				delete(s.seenPackets, k)
+			}
+		}
+	}
+	s.seenPacketsMu.Unlock()
+
 	// Rate limiting: max 256 packets per second
 	const maxPacketsPerSecond = 256
 	s.rateLimitMu.Lock()
-	now := time.Now()
 	if now.Sub(s.rateLimitTime) >= time.Second {
 		s.rateLimitCount = 0
 		s.rateLimitTime = now
