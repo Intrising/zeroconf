@@ -268,6 +268,38 @@ func (s *Server) shutdown() error {
 	return err
 }
 
+// isSourceInInterfaceSubnet checks if the source IP is in the same subnet as the interface
+func (s *Server) isSourceInInterfaceSubnet(ifIndex int, from net.Addr) bool {
+	if from == nil {
+		return true // No source to check
+	}
+
+	// Extract source IP
+	var srcIP net.IP
+	if udpAddr, ok := from.(*net.UDPAddr); ok {
+		srcIP = udpAddr.IP
+	}
+	if srcIP == nil {
+		return true // Can't determine source IP
+	}
+
+	// Find the interface by ifIndex and check subnet
+	for _, cache := range s.ifaceAddrs {
+		if cache.iface.Index == ifIndex {
+			for _, addr := range cache.addrs {
+				if ipNet, ok := addr.(*net.IPNet); ok {
+					if ipNet.Contains(srcIP) {
+						return true
+					}
+				}
+			}
+			return false // Interface found but source not in subnet
+		}
+	}
+
+	return true // Interface not found in cache, allow packet
+}
+
 // recv is a long running routine to receive packets from an interface
 func (s *Server) recv4(c *ipv4.PacketConn) {
 	if c == nil {
@@ -288,6 +320,10 @@ func (s *Server) recv4(c *ipv4.PacketConn) {
 			}
 			if cm != nil {
 				ifIndex = cm.IfIndex
+			}
+			// Skip if source IP not in same subnet as receiving interface
+			if !s.isSourceInInterfaceSubnet(ifIndex, from) {
+				continue
 			}
 			_ = s.parsePacket(buf[:n], ifIndex, from)
 		}
@@ -314,6 +350,10 @@ func (s *Server) recv6(c *ipv6.PacketConn) {
 			}
 			if cm != nil {
 				ifIndex = cm.IfIndex
+			}
+			// Skip if source IP not in same subnet as receiving interface
+			if !s.isSourceInInterfaceSubnet(ifIndex, from) {
+				continue
 			}
 			_ = s.parsePacket(buf[:n], ifIndex, from)
 		}
