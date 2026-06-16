@@ -413,7 +413,7 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
         resp.Question = nil
         resp.Answer = []dns.RR{}
         resp.Extra = []dns.RR{}
-        if err = s.handleQuestion(q, &resp, query, from); err != nil {
+        if err = s.handleQuestion(q, &resp, query, ifIndex, from); err != nil {
             continue
         }
         if len(resp.Answer) == 0 {
@@ -459,7 +459,7 @@ func isKnownAnswer(resp *dns.Msg, query *dns.Msg) bool {
 }
 
 // handleQuestion is used to handle an incoming question
-func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, from net.Addr) error {
+func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, ifIndex int, from net.Addr) error {
     if s.service == nil {
         return nil
     }
@@ -470,17 +470,17 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, f
             resp.Answer = nil
         }
     case s.service.ServiceName():
-        s.composeBrowsingAnswers(resp, from)
+        s.composeBrowsingAnswers(resp, ifIndex, from)
         if isKnownAnswer(resp, query) {
             resp.Answer = nil
         }
     case s.service.ServiceInstanceName():
-        s.composeLookupAnswers(resp, s.ttl, from, false)
+        s.composeLookupAnswers(resp, s.ttl, ifIndex, from, false)
     default:
         for _, subtype := range s.service.Subtypes {
             subtype = fmt.Sprintf("%s._sub.%s", subtype, s.service.ServiceName())
             if q.Name == subtype {
-                s.composeBrowsingAnswers(resp, from)
+                s.composeBrowsingAnswers(resp, ifIndex, from)
                 if isKnownAnswer(resp, query) {
                     resp.Answer = nil
                 }
@@ -491,7 +491,7 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, f
     return nil
 }
 
-func (s *Server) composeBrowsingAnswers(resp *dns.Msg, from net.Addr) {
+func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ifIndex int, from net.Addr) {
     ptr := &dns.PTR{
         Hdr: dns.RR_Header{
             Name:   s.service.ServiceName(),
@@ -524,10 +524,10 @@ func (s *Server) composeBrowsingAnswers(resp *dns.Msg, from net.Addr) {
         Target:   s.service.HostName,
     }
     resp.Extra = append(resp.Extra, srv, txt)
-    resp.Extra = s.appendAddrs(resp.Extra, s.ttl, from, false)
+    resp.Extra = s.appendAddrs(resp.Extra, s.ttl, ifIndex, from, false)
 }
 
-func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, from net.Addr, flushCache bool) {
+func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, ifIndex int, from net.Addr, flushCache bool) {
     ptr := &dns.PTR{
         Hdr: dns.RR_Header{
             Name:   s.service.ServiceName(),
@@ -580,7 +580,7 @@ func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, from net.Addr, 
                 Ptr: s.service.ServiceInstanceName(),
             })
     }
-    resp.Answer = s.appendAddrs(resp.Answer, ttl, from, flushCache)
+    resp.Answer = s.appendAddrs(resp.Answer, ttl, ifIndex, from, flushCache)
 }
 
 func (s *Server) serviceTypeName(resp *dns.Msg, ttl uint32, from net.Addr) {
@@ -650,7 +650,7 @@ func (s *Server) probe() {
 			resp.Compress = true
 			resp.Answer = []dns.RR{}
 			resp.Extra = []dns.RR{}
-			s.composeLookupAnswers(resp, s.ttl, nil, true)
+			s.composeLookupAnswers(resp, s.ttl, intf.Index, nil, true)
 			if err := s.multicastResponse(resp, intf.Index); err != nil {
 				log.Println("[ERR] zeroconf: failed to send announcement:", err.Error())
 			}
@@ -662,77 +662,98 @@ func (s *Server) probe() {
 
 // announceText sends a Text announcement with cache flush enabled
 func (s *Server) announceText() {
-	resp := new(dns.Msg)
-	resp.MsgHdr.Response = true
+	for _, intf := range s.ifaces {
+		resp := new(dns.Msg)
+		resp.MsgHdr.Response = true
 
-	txt := &dns.TXT{
-		Hdr: dns.RR_Header{
-			Name:   s.service.ServiceInstanceName(),
-			Rrtype: dns.TypeTXT,
-			Class:  dns.ClassINET | qClassCacheFlush,
-			Ttl:    s.ttl,
-		},
-		Txt: s.service.Text,
+		txt := &dns.TXT{
+			Hdr: dns.RR_Header{
+				Name:   s.service.ServiceInstanceName(),
+				Rrtype: dns.TypeTXT,
+				Class:  dns.ClassINET | qClassCacheFlush,
+				Ttl:    s.ttl,
+			},
+			Txt: s.service.Text,
+		}
+		resp.Answer = s.appendAddrs([]dns.RR{txt}, s.ttl, intf.Index, nil, true)
+		s.multicastResponse(resp, intf.Index)
 	}
-	resp.Answer = s.appendAddrs([]dns.RR{txt}, s.ttl, nil, true)
-	s.multicastResponse(resp, 0)
 }
 
 func (s *Server) unregister() error {
-	resp := new(dns.Msg)
-	resp.MsgHdr.Response = true
-	resp.Answer = []dns.RR{}
-	resp.Extra = []dns.RR{}
-	s.composeLookupAnswers(resp, 0, nil, true)
-	return s.multicastResponse(resp, 0)
+	var firstErr error
+	for _, intf := range s.ifaces {
+		resp := new(dns.Msg)
+		resp.MsgHdr.Response = true
+		resp.Answer = []dns.RR{}
+		resp.Extra = []dns.RR{}
+		s.composeLookupAnswers(resp, 0, intf.Index, nil, true)
+		if err := s.multicastResponse(resp, intf.Index); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
-func (s *Server) appendAddrs(list []dns.RR, ttl uint32, from net.Addr, flushCache bool) []dns.RR {
+func (s *Server) appendAddrs(list []dns.RR, ttl uint32, ifIndex int, from net.Addr, flushCache bool) []dns.RR {
     var v4, v6 []net.IP
 
-    // If no source address is provided, fall back to all pre-populated IPs
-    if from == nil {
-        v4 = s.service.AddrIPv4
-        v6 = s.service.AddrIPv6
-        if len(v4) == 0 && len(v6) == 0 {
-            // Use cached interface addresses
-            for _, cache := range s.ifaceAddrs {
-                v4 = append(v4, cache.v4...)
-                v6 = append(v6, cache.v6...)
+    if ifIndex != 0 {
+        for _, cache := range s.ifaceAddrs {
+            if cache.iface.Index == ifIndex {
+                v4 = cache.v4
+                v6 = cache.v6
+                break
             }
         }
-    } else {
-        // Extract the source IP from the incoming packet
-        var srcIP net.IP
-        if udpAddr, ok := from.(*net.UDPAddr); ok {
-            srcIP = udpAddr.IP
-        }
+    }
 
-        // If we have a source IP, find the interface with a matching IP or subnet
-        // Use cached s.ifaceAddrs to avoid expensive syscalls on every query
-        if srcIP != nil {
-            for _, cache := range s.ifaceAddrs {
-                for _, addr := range cache.addrs {
-                    if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
-                        // Check if the source IP is in the same subnet or matches the interface IP
-                        if ipNet.Contains(srcIP) || ipNet.IP.Equal(srcIP) {
-                            // Use cached IPs instead of calling addrsForInterface
-                            v4 = append(v4, cache.v4...)
-                            v6 = append(v6, cache.v6...)
-                            break
-                        }
-                    }
-                }
-                if len(v4) > 0 || len(v6) > 0 {
-                    break
-                }
-            }
-        }
-
-        // If no matching interface was found, fall back to pre-populated IPs
-        if len(v4) == 0 && len(v6) == 0 {
+    // If interface not found or ifIndex was 0, fall back to other methods
+    if len(v4) == 0 && len(v6) == 0 {
+        // If no source address is provided, fall back to all pre-populated IPs
+        if from == nil {
             v4 = s.service.AddrIPv4
             v6 = s.service.AddrIPv6
+            if len(v4) == 0 && len(v6) == 0 {
+                // Use cached interface addresses
+                for _, cache := range s.ifaceAddrs {
+                    v4 = append(v4, cache.v4...)
+                    v6 = append(v6, cache.v6...)
+                }
+            }
+        } else {
+            // Extract the source IP from the incoming packet
+            var srcIP net.IP
+            if udpAddr, ok := from.(*net.UDPAddr); ok {
+                srcIP = udpAddr.IP
+            }
+
+            // If we have a source IP, find the interface with a matching IP or subnet
+            // Use cached s.ifaceAddrs to avoid expensive syscalls on every query
+            if srcIP != nil {
+                for _, cache := range s.ifaceAddrs {
+                    for _, addr := range cache.addrs {
+                        if ipNet, ok := addr.(*net.IPNet); ok && !ipNet.IP.IsLoopback() {
+                            // Check if the source IP is in the same subnet or matches the interface IP
+                            if ipNet.Contains(srcIP) || ipNet.IP.Equal(srcIP) {
+                                // Use cached IPs instead of calling addrsForInterface
+                                v4 = append(v4, cache.v4...)
+                                v6 = append(v6, cache.v6...)
+                                break
+                            }
+                        }
+                    }
+                    if len(v4) > 0 || len(v6) > 0 {
+                        break
+                    }
+                }
+            }
+
+            // If no matching interface was found, fall back to pre-populated IPs
+            if len(v4) == 0 && len(v6) == 0 {
+                v4 = s.service.AddrIPv4
+                v6 = s.service.AddrIPv6
+            }
         }
     }
 
