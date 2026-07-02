@@ -166,6 +166,11 @@ type Server struct {
 	ttl            uint32
 	disableKnownAnswerSuppression bool
 
+	// SuppressCheck: if set, returning true suppresses the mDNS response.
+	// Used by SuppressBeforeUpdate: blocks responses in the 10s window before
+	// atdatetime is updated, so the test tool never sees new TXT while HTTP cache is stale.
+	suppressCheck func() bool
+
 	// Rate limiting for mDNS packets
 	rateLimitCount int64
 	rateLimitTime  time.Time
@@ -254,6 +259,15 @@ func (s *Server) TTL(ttl uint32) {
 // already has the answer cached. This helps clients with stale TXT cache get fresh data.
 func (s *Server) SetKnownAnswerSuppression(enabled bool) {
 	s.disableKnownAnswerSuppression = !enabled
+}
+
+// SetSuppressCheck registers a callback that is called before each mDNS response.
+// If the callback returns true, the response is suppressed (not sent).
+// Used to implement SuppressBeforeUpdate: block responses in the 10-second window
+// before a periodic atdatetime update so the test tool always fetches fresh HTTP
+// before it can compare against the new TXT value.
+func (s *Server) SetSuppressCheck(fn func() bool) {
+	s.suppressCheck = fn
 }
 
 
@@ -473,6 +487,13 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
             }
         }
         log.Printf("[zeroconf-dbg] query %s from %v ifIndex=%d => %d answers (service=%s, txt_atdatetime=%s, server_ptr=%p, ttl=%d)", q.Name, from, ifIndex, len(resp.Answer), s.service.ServiceName(), dbgAtdt, s, s.ttl)
+        // SuppressBeforeUpdate: block response in the window before atdatetime update.
+        // The test tool fetches HTTP after seeing new TXT; suppressing ensures it cannot
+        // see the new TXT until its HTTP cache already reflects the new atdatetime.
+        if s.suppressCheck != nil && s.suppressCheck() {
+            log.Printf("[zeroconf-dbg] suppress-before-update: blocking response to %v for %s (txt_atdatetime=%s)", from, q.Name, dbgAtdt)
+            continue
+        }
         if isUnicastQuestion(q) {
             log.Printf("[zeroconf-dbg] sending unicast response to %v for %s (txt_atdatetime=%s)", from, q.Name, dbgAtdt)
             if e := s.unicastResponse(&resp, ifIndex, from); e != nil {
