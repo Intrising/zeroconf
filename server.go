@@ -473,34 +473,34 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
         }
         if len(resp.Answer) == 0 {
             // Only log when query is relevant to this service (reduce noise)
-            if q.Name == s.service.ServiceName() || q.Name == s.service.ServiceInstanceName() {
-                log.Printf("[zeroconf-dbg] query %s from %v ifIndex=%d => no answer (service=%s, server_ptr=%p) SUPPRESSED", q.Name, from, ifIndex, s.service.ServiceName(), s)
-            }
+//             if q.Name == s.service.ServiceName() || q.Name == s.service.ServiceInstanceName() {
+//                 log.Printf("[zeroconf-dbg] query %s from %v ifIndex=%d => no answer (service=%s, server_ptr=%p) SUPPRESSED", q.Name, from, ifIndex, s.service.ServiceName(), s)
+//             }
             continue
         }
         // Extract atdatetime from current TXT for debug
-        dbgAtdt := ""
-        for _, t := range s.service.Text {
-            if len(t) > 11 && t[:11] == "atdatetime=" {
-                dbgAtdt = t[11:]
-                break
-            }
-        }
-        log.Printf("[zeroconf-dbg] query %s from %v ifIndex=%d => %d answers (service=%s, txt_atdatetime=%s, server_ptr=%p, ttl=%d)", q.Name, from, ifIndex, len(resp.Answer), s.service.ServiceName(), dbgAtdt, s, s.ttl)
+//         dbgAtdt := ""
+//         for _, t := range s.service.Text {
+//             if len(t) > 11 && t[:11] == "atdatetime=" {
+//                 dbgAtdt = t[11:]
+//                 break
+//             }
+//         }
+//         log.Printf("[zeroconf-dbg] query %s from %v ifIndex=%d => %d answers (service=%s, txt_atdatetime=%s, server_ptr=%p, ttl=%d)", q.Name, from, ifIndex, len(resp.Answer), s.service.ServiceName(), dbgAtdt, s, s.ttl)
         // SuppressBeforeUpdate: block response in the window before atdatetime update.
         // The test tool fetches HTTP after seeing new TXT; suppressing ensures it cannot
         // see the new TXT until its HTTP cache already reflects the new atdatetime.
         if s.suppressCheck != nil && s.suppressCheck() {
-            log.Printf("[zeroconf-dbg] suppress-before-update: blocking response to %v for %s (txt_atdatetime=%s)", from, q.Name, dbgAtdt)
+//             log.Printf("[zeroconf-dbg] suppress-before-update: blocking response to %v for %s (txt_atdatetime=%s)", from, q.Name, dbgAtdt)
             continue
         }
         if isUnicastQuestion(q) {
-            log.Printf("[zeroconf-dbg] sending unicast response to %v for %s (txt_atdatetime=%s)", from, q.Name, dbgAtdt)
+//             log.Printf("[zeroconf-dbg] sending unicast response to %v for %s (txt_atdatetime=%s)", from, q.Name, dbgAtdt)
             if e := s.unicastResponse(&resp, ifIndex, from); e != nil {
                 err = e
             }
         } else {
-            log.Printf("[zeroconf-dbg] sending multicast response for %s ifIndex=%d (txt_atdatetime=%s)", q.Name, ifIndex, dbgAtdt)
+//             log.Printf("[zeroconf-dbg] sending multicast response for %s ifIndex=%d (txt_atdatetime=%s)", q.Name, ifIndex, dbgAtdt)
             if e := s.multicastResponse(&resp, ifIndex); e != nil {
                 err = e
             }
@@ -729,7 +729,7 @@ func (s *Server) probe() {
 			resp.Answer = []dns.RR{}
 			resp.Extra = []dns.RR{}
 			s.composeLookupAnswers(resp, s.ttl, intf.Index, nil, true)
-			log.Printf("[zeroconf-dbg] probe announcement iface=%s ttl=%d service=%s", intf.Name, s.ttl, s.service.ServiceName())
+// 			log.Printf("[zeroconf-dbg] probe announcement iface=%s ttl=%d service=%s", intf.Name, s.ttl, s.service.ServiceName())
 			if err := s.multicastResponse(resp, intf.Index); err != nil {
 				log.Println("[ERR] zeroconf: failed to send announcement:", err.Error())
 			}
@@ -741,13 +741,13 @@ func (s *Server) probe() {
 
 // announceText sends a Text announcement with cache flush enabled
 func (s *Server) announceText() {
-	dbgAtdt := ""
-	for _, t := range s.service.Text {
-		if len(t) > 11 && t[:11] == "atdatetime=" {
-			dbgAtdt = t[11:]
-			break
-		}
-	}
+// 	dbgAtdt := ""
+// 	for _, t := range s.service.Text {
+// 		if len(t) > 11 && t[:11] == "atdatetime=" {
+// 			dbgAtdt = t[11:]
+// 			break
+// 		}
+// 	}
 	for _, intf := range s.ifaces {
 		resp := new(dns.Msg)
 		resp.MsgHdr.Response = true
@@ -762,7 +762,7 @@ func (s *Server) announceText() {
 			Txt: s.service.Text,
 		}
 		resp.Answer = s.appendAddrs([]dns.RR{txt}, s.ttl, intf.Index, nil, true)
-		log.Printf("[zeroconf-dbg] announceText service=%s iface=%s txt_atdatetime=%s answers=%d ttl=%d", s.service.ServiceName(), intf.Name, dbgAtdt, len(resp.Answer), s.ttl)
+// 		log.Printf("[zeroconf-dbg] announceText service=%s iface=%s txt_atdatetime=%s answers=%d ttl=%d", s.service.ServiceName(), intf.Name, dbgAtdt, len(resp.Answer), s.ttl)
 		s.multicastResponse(resp, intf.Index)
 	}
 }

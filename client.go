@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 	"strings"
 	"time"
 
@@ -143,6 +144,7 @@ type client struct {
 	ipv4conn *ipv4.PacketConn
 	ipv6conn *ipv6.PacketConn
 	ifaces   []net.Interface
+	recvWg   sync.WaitGroup
 }
 
 // Client structure constructor
@@ -182,10 +184,18 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 	// start listening for responses
 	msgCh := make(chan *dns.Msg, 32)
 	if c.ipv4conn != nil {
-		go c.recv(ctx, c.ipv4conn, msgCh)
+		c.recvWg.Add(1)
+		go func() {
+			defer c.recvWg.Done()
+			c.recv(ctx, c.ipv4conn, msgCh)
+		}()
 	}
 	if c.ipv6conn != nil {
-		go c.recv(ctx, c.ipv6conn, msgCh)
+		c.recvWg.Add(1)
+		go func() {
+			defer c.recvWg.Done()
+			c.recv(ctx, c.ipv6conn, msgCh)
+		}()
 	}
 
 	// Iterate through channels from listeners goroutines
@@ -305,11 +315,14 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 // Shutdown client will close currently open connections and channel implicitly.
 func (c *client) shutdown() {
 	if c.ipv4conn != nil {
+		c.ipv4conn.SetReadDeadline(time.Now())
 		c.ipv4conn.Close()
 	}
 	if c.ipv6conn != nil {
+		c.ipv6conn.SetReadDeadline(time.Now())
 		c.ipv6conn.Close()
 	}
+	c.recvWg.Wait()
 }
 
 // Data receiving routine reads from connection, unpacks packets into dns.Msg
