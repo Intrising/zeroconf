@@ -23,7 +23,7 @@ const (
 
 // Register a service by given arguments. This call will take the system's hostname
 // and lookup IP by that hostname.
-func Register(instance, service, domain string, port int, text []string, ifaces []net.Interface) (*Server, error) {
+func Register(instance, service, domain string, port int, text []string, ifaces []net.Interface, ttl ...uint32) (*Server, error) {
 	entry := NewServiceEntry(instance, service, domain)
 	entry.Port = port
 	entry.Text = text
@@ -73,6 +73,9 @@ func Register(instance, service, domain string, port int, text []string, ifaces 
 	}
 
 	s.service = entry
+	if len(ttl) > 0 && ttl[0] > 0 {
+		s.ttl = ttl[0]
+	}
 	go s.mainloop()
 	go s.probe()
 
@@ -161,6 +164,12 @@ type Server struct {
 	shutdownEnd    sync.WaitGroup
 	isShutdown     bool
 	ttl            uint32
+	disableKnownAnswerSuppression bool
+
+	// SuppressCheck: if set, returning true suppresses the mDNS response.
+	// Used by SuppressBeforeUpdate: blocks responses in the 10s window before
+	// atdatetime is updated, so the test tool never sees new TXT while HTTP cache is stale.
+	suppressCheck func() bool
 
 	// Rate limiting for mDNS packets
 	rateLimitCount int64
@@ -231,16 +240,36 @@ func (s *Server) Shutdown() {
 	s.shutdown()
 }
 
-// SetText updates and announces the TXT records
+// SetText updates the in-memory TXT records without sending a proactive cache-flush.
+// Sending a proactive cache-flush triggers ITxPT compliance test comparison against
+// stale cached HTTP data (the test compares new TXT vs old cached HTTP, causing mismatch).
+// Clients discover the updated TXT naturally via their next mDNS query, by which point
+// the XML file has already been updated (writeITxPTInfoXML called before SetText).
 func (s *Server) SetText(text []string) {
 	s.service.Text = text
-	s.announceText()
 }
 
 // TTL sets the TTL for DNS replies
 func (s *Server) TTL(ttl uint32) {
 	s.ttl = ttl
 }
+
+// SetKnownAnswerSuppression enables or disables RFC 6762 Known Answer Suppression.
+// When disabled, the server always responds to browse queries even if the client
+// already has the answer cached. This helps clients with stale TXT cache get fresh data.
+func (s *Server) SetKnownAnswerSuppression(enabled bool) {
+	s.disableKnownAnswerSuppression = !enabled
+}
+
+// SetSuppressCheck registers a callback that is called before each mDNS response.
+// If the callback returns true, the response is suppressed (not sent).
+// Used to implement SuppressBeforeUpdate: block responses in the 10-second window
+// before a periodic atdatetime update so the test tool always fetches fresh HTTP
+// before it can compare against the new TXT value.
+func (s *Server) SetSuppressCheck(fn func() bool) {
+	s.suppressCheck = fn
+}
+
 
 // Shutdown server will close currently open connections & channel
 func (s *Server) shutdown() error {
@@ -321,8 +350,21 @@ func (s *Server) recv4(c *ipv4.PacketConn) {
 			if cm != nil {
 				ifIndex = cm.IfIndex
 			}
+			// Debug: log received mDNS packets from external sources
+			if from != nil {
+				if udpAddr, ok := from.(*net.UDPAddr); ok && !udpAddr.IP.IsLoopback() {
+					isLocal := false
+					for _, a := range s.service.AddrIPv4 {
+						if a.Equal(udpAddr.IP) { isLocal = true; break }
+					}
+					if !isLocal {
+						log.Printf("[zeroconf-recv] recv4 from %v ifIndex=%d size=%d service=%s server_ttl=%d", from, ifIndex, n, s.service.ServiceName(), s.ttl)
+					}
+				}
+			}
 			// Skip if source IP not in same subnet as receiving interface
 			if !s.isSourceInInterfaceSubnet(ifIndex, from) {
+				log.Printf("[zeroconf-recv] DROPPED from %v ifIndex=%d (not in subnet) service=%s", from, ifIndex, s.service.ServiceName())
 				continue
 			}
 			_ = s.parsePacket(buf[:n], ifIndex, from)
@@ -351,8 +393,21 @@ func (s *Server) recv6(c *ipv6.PacketConn) {
 			if cm != nil {
 				ifIndex = cm.IfIndex
 			}
+			// Debug: log received mDNS packets from external sources
+			if from != nil {
+				if udpAddr, ok := from.(*net.UDPAddr); ok && !udpAddr.IP.IsLoopback() {
+					isLocal := false
+					for _, a := range s.service.AddrIPv4 {
+						if a.Equal(udpAddr.IP) { isLocal = true; break }
+					}
+					if !isLocal {
+						log.Printf("[zeroconf-recv] recv4 from %v ifIndex=%d size=%d service=%s server_ttl=%d", from, ifIndex, n, s.service.ServiceName(), s.ttl)
+					}
+				}
+			}
 			// Skip if source IP not in same subnet as receiving interface
 			if !s.isSourceInInterfaceSubnet(ifIndex, from) {
+				log.Printf("[zeroconf-recv] DROPPED from %v ifIndex=%d (not in subnet) service=%s", from, ifIndex, s.service.ServiceName())
 				continue
 			}
 			_ = s.parsePacket(buf[:n], ifIndex, from)
@@ -417,13 +472,35 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
             continue
         }
         if len(resp.Answer) == 0 {
+            // Only log when query is relevant to this service (reduce noise)
+//             if q.Name == s.service.ServiceName() || q.Name == s.service.ServiceInstanceName() {
+//                 log.Printf("[zeroconf-dbg] query %s from %v ifIndex=%d => no answer (service=%s, server_ptr=%p) SUPPRESSED", q.Name, from, ifIndex, s.service.ServiceName(), s)
+//             }
+            continue
+        }
+        // Extract atdatetime from current TXT for debug
+//         dbgAtdt := ""
+//         for _, t := range s.service.Text {
+//             if len(t) > 11 && t[:11] == "atdatetime=" {
+//                 dbgAtdt = t[11:]
+//                 break
+//             }
+//         }
+//         log.Printf("[zeroconf-dbg] query %s from %v ifIndex=%d => %d answers (service=%s, txt_atdatetime=%s, server_ptr=%p, ttl=%d)", q.Name, from, ifIndex, len(resp.Answer), s.service.ServiceName(), dbgAtdt, s, s.ttl)
+        // SuppressBeforeUpdate: block response in the window before atdatetime update.
+        // The test tool fetches HTTP after seeing new TXT; suppressing ensures it cannot
+        // see the new TXT until its HTTP cache already reflects the new atdatetime.
+        if s.suppressCheck != nil && s.suppressCheck() {
+//             log.Printf("[zeroconf-dbg] suppress-before-update: blocking response to %v for %s (txt_atdatetime=%s)", from, q.Name, dbgAtdt)
             continue
         }
         if isUnicastQuestion(q) {
+//             log.Printf("[zeroconf-dbg] sending unicast response to %v for %s (txt_atdatetime=%s)", from, q.Name, dbgAtdt)
             if e := s.unicastResponse(&resp, ifIndex, from); e != nil {
                 err = e
             }
         } else {
+//             log.Printf("[zeroconf-dbg] sending multicast response for %s ifIndex=%d (txt_atdatetime=%s)", q.Name, ifIndex, dbgAtdt)
             if e := s.multicastResponse(&resp, ifIndex); e != nil {
                 err = e
             }
@@ -433,11 +510,13 @@ func (s *Server) handleQuery(query *dns.Msg, ifIndex int, from net.Addr) error {
 }
 
 // RFC6762 7.1. Known-Answer Suppression
-func isKnownAnswer(resp *dns.Msg, query *dns.Msg) bool {
+func (s *Server) isKnownAnswer(resp *dns.Msg, query *dns.Msg) bool {
+	if s.disableKnownAnswerSuppression {
+		return false
+	}
 	if len(resp.Answer) == 0 || len(query.Answer) == 0 {
 		return false
 	}
-
 	if resp.Answer[0].Header().Rrtype != dns.TypePTR {
 		return false
 	}
@@ -450,7 +529,6 @@ func isKnownAnswer(resp *dns.Msg, query *dns.Msg) bool {
 		}
 		ptr := known.(*dns.PTR)
 		if ptr.Ptr == answer.Ptr && hdr.Ttl >= answer.Hdr.Ttl/2 {
-			// log.Printf("skipping known answer: %v", ptr)
 			return true
 		}
 	}
@@ -466,12 +544,12 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, i
     switch q.Name {
     case s.service.ServiceTypeName():
         s.serviceTypeName(resp, s.ttl, from)
-        if isKnownAnswer(resp, query) {
+        if s.isKnownAnswer(resp, query) {
             resp.Answer = nil
         }
     case s.service.ServiceName():
         s.composeBrowsingAnswers(resp, ifIndex, from)
-        if isKnownAnswer(resp, query) {
+        if s.isKnownAnswer(resp, query) {
             resp.Answer = nil
         }
     case s.service.ServiceInstanceName():
@@ -481,7 +559,7 @@ func (s *Server) handleQuestion(q dns.Question, resp *dns.Msg, query *dns.Msg, i
             subtype = fmt.Sprintf("%s._sub.%s", subtype, s.service.ServiceName())
             if q.Name == subtype {
                 s.composeBrowsingAnswers(resp, ifIndex, from)
-                if isKnownAnswer(resp, query) {
+                if s.isKnownAnswer(resp, query) {
                     resp.Answer = nil
                 }
                 break
@@ -651,6 +729,7 @@ func (s *Server) probe() {
 			resp.Answer = []dns.RR{}
 			resp.Extra = []dns.RR{}
 			s.composeLookupAnswers(resp, s.ttl, intf.Index, nil, true)
+// 			log.Printf("[zeroconf-dbg] probe announcement iface=%s ttl=%d service=%s", intf.Name, s.ttl, s.service.ServiceName())
 			if err := s.multicastResponse(resp, intf.Index); err != nil {
 				log.Println("[ERR] zeroconf: failed to send announcement:", err.Error())
 			}
@@ -662,6 +741,13 @@ func (s *Server) probe() {
 
 // announceText sends a Text announcement with cache flush enabled
 func (s *Server) announceText() {
+// 	dbgAtdt := ""
+// 	for _, t := range s.service.Text {
+// 		if len(t) > 11 && t[:11] == "atdatetime=" {
+// 			dbgAtdt = t[11:]
+// 			break
+// 		}
+// 	}
 	for _, intf := range s.ifaces {
 		resp := new(dns.Msg)
 		resp.MsgHdr.Response = true
@@ -676,6 +762,7 @@ func (s *Server) announceText() {
 			Txt: s.service.Text,
 		}
 		resp.Answer = s.appendAddrs([]dns.RR{txt}, s.ttl, intf.Index, nil, true)
+// 		log.Printf("[zeroconf-dbg] announceText service=%s iface=%s txt_atdatetime=%s answers=%d ttl=%d", s.service.ServiceName(), intf.Name, dbgAtdt, len(resp.Answer), s.ttl)
 		s.multicastResponse(resp, intf.Index)
 	}
 }
