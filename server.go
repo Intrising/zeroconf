@@ -240,13 +240,18 @@ func (s *Server) Shutdown() {
 	s.shutdown()
 }
 
-// SetText updates the in-memory TXT records without sending a proactive cache-flush.
-// Sending a proactive cache-flush triggers ITxPT compliance test comparison against
-// stale cached HTTP data (the test compares new TXT vs old cached HTTP, causing mismatch).
-// Clients discover the updated TXT naturally via their next mDNS query, by which point
-// the XML file has already been updated (writeITxPTInfoXML called before SetText).
+// SetText updates the TXT records and announces them, so a subscriber learns the
+// new value without having to query first (ITxPT S02 requires the module to send
+// an unsolicited announcement each update interval).
+//
+// The announcement was removed in 92ce7d5 because it could reach the compliance
+// tool while moduleinfo.xml still held the previous atdatetime, which the tool
+// reported as a TXT/XML mismatch. The caller now writes the XML before calling
+// SetText, so the announced value is never ahead of the file and the
+// announcement is safe to send again.
 func (s *Server) SetText(text []string) {
 	s.service.Text = text
+	s.announceText()
 }
 
 // TTL sets the TTL for DNS replies
