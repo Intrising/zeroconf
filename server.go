@@ -166,6 +166,13 @@ type Server struct {
 	ttl            uint32
 	disableKnownAnswerSuppression bool
 
+	// textMu guards service.Text. SetText replaces the slice from the caller's
+	// goroutine while recv4/recv6 -> handleQuery read it, and a slice header is
+	// not written atomically: a responder could otherwise pair the new data
+	// pointer with the old length. Now that SetText runs on a fixed schedule the
+	// overlap with inbound queries is routine rather than incidental.
+	textMu sync.RWMutex
+
 	// SuppressCheck: if set, returning true suppresses the mDNS response.
 	// Used by SuppressBeforeUpdate: blocks responses in the 10s window before
 	// atdatetime is updated, so the test tool never sees new TXT while HTTP cache is stale.
@@ -250,8 +257,19 @@ func (s *Server) Shutdown() {
 // SetText, so the announced value is never ahead of the file and the
 // announcement is safe to send again.
 func (s *Server) SetText(text []string) {
+	s.textMu.Lock()
 	s.service.Text = text
+	s.textMu.Unlock()
 	s.announceText()
+}
+
+// textSnapshot returns the current TXT strings under the read lock. SetText
+// replaces the slice rather than mutating it, so the returned value stays
+// consistent for the caller; callers must not modify it.
+func (s *Server) textSnapshot() []string {
+	s.textMu.RLock()
+	defer s.textMu.RUnlock()
+	return s.service.Text
 }
 
 // TTL sets the TTL for DNS replies
@@ -274,7 +292,6 @@ func (s *Server) SetKnownAnswerSuppression(enabled bool) {
 func (s *Server) SetSuppressCheck(fn func() bool) {
 	s.suppressCheck = fn
 }
-
 
 // Shutdown server will close currently open connections & channel
 func (s *Server) shutdown() error {
@@ -592,7 +609,7 @@ func (s *Server) composeBrowsingAnswers(resp *dns.Msg, ifIndex int, from net.Add
             Class:  dns.ClassINET,
             Ttl:    s.ttl,
         },
-        Txt: s.service.Text,
+        Txt: s.textSnapshot(),
     }
     srv := &dns.SRV{
         Hdr: dns.RR_Header{
@@ -639,7 +656,7 @@ func (s *Server) composeLookupAnswers(resp *dns.Msg, ttl uint32, ifIndex int, fr
             Class:  dns.ClassINET | qClassCacheFlush,
             Ttl:    ttl,
         },
-        Txt: s.service.Text,
+        Txt: s.textSnapshot(),
     }
     dnssd := &dns.PTR{
         Hdr: dns.RR_Header{
@@ -705,7 +722,7 @@ func (s *Server) probe() {
 			Class:  dns.ClassINET,
 			Ttl:    s.ttl,
 		},
-		Txt: s.service.Text,
+		Txt: s.textSnapshot(),
 	}
 	q.Ns = []dns.RR{srv, txt}
 
@@ -745,30 +762,67 @@ func (s *Server) probe() {
 }
 
 // announceText sends a Text announcement with cache flush enabled
+// announceText multicasts the current TXT record without waiting for a query.
+//
+// RFC 6762 8.4 requires at least two unsolicited responses one second apart:
+// mDNS is unacknowledged UDP multicast, so on a busy LAN one dropped :5353
+// packet would cost a subscriber the whole update interval - ten minutes in the
+// ITxPT S02 test, which then reports the update as never received.
+//
+// The repetitions run in their own goroutine so SetText stays non-blocking for
+// its caller, which holds a lock while updating the service record.
 func (s *Server) announceText() {
-// 	dbgAtdt := ""
-// 	for _, t := range s.service.Text {
-// 		if len(t) > 11 && t[:11] == "atdatetime=" {
-// 			dbgAtdt = t[11:]
-// 			break
-// 		}
-// 	}
+	go func() {
+		for i := 0; i < multicastRepetitions; i++ {
+			if i > 0 {
+				time.Sleep(time.Second)
+			}
+			// Shutdown() sends the goodbye records and only then closes the
+			// conns and sets isShutdown, so a periodic updater can land inside
+			// that window and re-announce a service that was just withdrawn -
+			// peers would re-cache it for the whole TTL.
+			s.shutdownLock.Lock()
+			down := s.isShutdown
+			s.shutdownLock.Unlock()
+			if down {
+				return
+			}
+			// handleQuery consults suppressCheck before answering; an
+			// unsolicited announcement carries the same record, so it has to
+			// honour the same gate or the suppression window would leak the
+			// value it exists to hold back.
+			if s.suppressCheck != nil && s.suppressCheck() {
+				continue
+			}
+			s.announceTextOnce()
+		}
+	}()
+}
+
+func (s *Server) announceTextOnce() {
+	text := s.textSnapshot()
+	name := s.service.ServiceInstanceName()
 	for _, intf := range s.ifaces {
 		resp := new(dns.Msg)
 		resp.MsgHdr.Response = true
 
 		txt := &dns.TXT{
 			Hdr: dns.RR_Header{
-				Name:   s.service.ServiceInstanceName(),
+				Name:   name,
 				Rrtype: dns.TypeTXT,
 				Class:  dns.ClassINET | qClassCacheFlush,
 				Ttl:    s.ttl,
 			},
-			Txt: s.service.Text,
+			Txt: text,
 		}
 		resp.Answer = s.appendAddrs([]dns.RR{txt}, s.ttl, intf.Index, nil, true)
-// 		log.Printf("[zeroconf-dbg] announceText service=%s iface=%s txt_atdatetime=%s answers=%d ttl=%d", s.service.ServiceName(), intf.Name, dbgAtdt, len(resp.Answer), s.ttl)
-		s.multicastResponse(resp, intf.Index)
+		// probe() and unregister() report their send errors; this path used to
+		// discard them, so an interface going down stopped the interval updates
+		// with nothing in the log - the failure only showed up as a failed
+		// compliance run.
+		if err := s.multicastResponse(resp, intf.Index); err != nil {
+			log.Printf("[zeroconf] announce %s on %s failed: %s", name, intf.Name, err)
+		}
 	}
 }
 
