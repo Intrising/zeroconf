@@ -164,3 +164,51 @@ func TestSubtype(t *testing.T) {
 		}
 	})
 }
+
+// TestBrowseWithRemoved registers a service, browses for it, shuts the server
+// down and expects the goodbye to be reported on the removed channel. It also
+// checks that the SRV priority and weight reach the entry.
+func TestBrowseWithRemoved(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	name := "test--removed-xxxx"
+	server, err := Register(name, mdnsService, mdnsDomain, mdnsPort, []string{"txtv=0"}, nil)
+	if err != nil {
+		t.Fatalf("Expected register success, but got %v", err)
+	}
+	time.Sleep(time.Second)
+
+	resolver, err := NewResolver(nil)
+	if err != nil {
+		t.Fatalf("Expected create resolver success, but got %v", err)
+	}
+	entries := make(chan *ServiceEntry, 100)
+	removed := make(chan *ServiceEntry, 100)
+	if err := resolver.BrowseWithRemoved(ctx, mdnsService, mdnsDomain, entries, removed); err != nil {
+		t.Fatalf("Expected browse success, but got %v", err)
+	}
+
+	select {
+	case e := <-entries:
+		if e.Instance != name {
+			t.Fatalf("Expected instance %s, but got %s", name, e.Instance)
+		}
+		if e.Priority != 0 || e.Weight != 0 {
+			t.Fatalf("Expected SRV priority/weight 0/0, but got %d/%d", e.Priority, e.Weight)
+		}
+	case <-ctx.Done():
+		t.Fatalf("Service was not discovered")
+	}
+
+	server.Shutdown()
+
+	select {
+	case e := <-removed:
+		if e.Instance != name {
+			t.Fatalf("Expected goodbye for %s, but got %s", name, e.Instance)
+		}
+	case <-ctx.Done():
+		t.Fatalf("Goodbye was not reported")
+	}
+}

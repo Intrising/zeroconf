@@ -69,6 +69,10 @@ func NewServiceRecord(instance, service string, domain string) *ServiceRecord {
 type lookupParams struct {
 	ServiceRecord
 	Entries chan<- *ServiceEntry // Entries Channel
+	// Removed, when set, receives every service instance for which a goodbye
+	// record (TTL 0) arrives while browsing. Nil keeps the old behaviour: the
+	// instance is dropped silently.
+	Removed chan<- *ServiceEntry
 
 	isBrowsing  bool
 	stopProbing chan struct{}
@@ -105,6 +109,8 @@ type ServiceEntry struct {
 	ServiceRecord
 	HostName string   `json:"hostname"` // Host machine DNS name
 	Port     int      `json:"port"`     // Service Port
+	Priority uint16   `json:"priority"` // SRV priority: lower is more preferred
+	Weight   uint16   `json:"weight"`   // SRV weight: higher is more preferred among equal priorities
 	Text     []string `json:"text"`     // Service info served as a TXT record
 	TTL      uint32   `json:"ttl"`      // TTL of the service record
 	AddrIPv4 []net.IP `json:"-"`        // Host machine IPv4 address

@@ -107,6 +107,36 @@ func (r *Resolver) Browse(ctx context.Context, service, domain string, entries c
 	return nil
 }
 
+// BrowseWithRemoved works like Browse and additionally reports, on removed,
+// every instance of the service for which a goodbye record (TTL 0) is
+// received. The reported entry carries the instance name; its other fields
+// are only what the goodbye packet contained. removed is never closed; the
+// caller stops reading it once entries has been closed.
+func (r *Resolver) BrowseWithRemoved(ctx context.Context, service, domain string, entries chan<- *ServiceEntry, removed chan<- *ServiceEntry) error {
+	params := defaultParams(service)
+	if domain != "" {
+		params.Domain = domain
+	}
+	params.Entries = entries
+	params.Removed = removed
+	params.isBrowsing = true
+	ctx, cancel := context.WithCancel(ctx)
+	go r.c.mainloop(ctx, params)
+
+	err := r.c.query(params)
+	if err != nil {
+		cancel()
+		return err
+	}
+	go func() {
+		if err := r.c.periodicQuery(ctx, params); err != nil {
+			cancel()
+		}
+	}()
+
+	return nil
+}
+
 // Lookup a specific service by its name and type in a given domain.
 func (r *Resolver) Lookup(ctx context.Context, instance, service, domain string, entries chan<- *ServiceEntry) error {
 	params := defaultParams(service)
@@ -243,6 +273,8 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 					}
 					entries[rr.Hdr.Name].HostName = rr.Target
 					entries[rr.Hdr.Name].Port = int(rr.Port)
+					entries[rr.Hdr.Name].Priority = rr.Priority
+					entries[rr.Hdr.Name].Weight = rr.Weight
 					entries[rr.Hdr.Name].TTL = rr.Hdr.Ttl
 				case *dns.TXT:
 					if params.ServiceInstanceName() != "" && params.ServiceInstanceName() != rr.Hdr.Name {
@@ -284,6 +316,14 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 				if e.TTL == 0 {
 					delete(entries, k)
 					delete(sentEntries, k)
+					if params.Removed != nil {
+						// Never block the receive loop on a subscriber that
+						// has gone away with the context.
+						select {
+						case params.Removed <- e:
+						case <-ctx.Done():
+						}
+					}
 					continue
 				}
 				if _, ok := sentEntries[k]; ok {
