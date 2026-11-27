@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 )
 
 // ServiceRecord contains the basic description of a service, which contains instance name, service type & domain
@@ -70,6 +71,16 @@ type lookupParams struct {
 	ServiceRecord
 	Entries chan<- *ServiceEntry // Entries Channel
 
+	// Watch mode (Resolver.Watch): events replaces Entries. Every answer of
+	// an instance and every goodbye is handed over as one WatchEvent, in the
+	// order the packets were received. queryInterval is the fixed interval at
+	// which the query is repeated for as long as the context lives; a value
+	// received on kick sends the query at once.
+	watch         bool
+	events        chan<- WatchEvent
+	queryInterval time.Duration
+	kick          <-chan struct{}
+
 	isBrowsing  bool
 	stopProbing chan struct{}
 	once        sync.Once
@@ -91,6 +102,10 @@ func newLookupParams(instance, service, domain string, isBrowsing bool, entries 
 // Notify subscriber that no more entries will arrive. Mostly caused
 // by an expired context.
 func (l *lookupParams) done() {
+	if l.watch {
+		close(l.events)
+		return
+	}
 	close(l.Entries)
 }
 
@@ -105,10 +120,22 @@ type ServiceEntry struct {
 	ServiceRecord
 	HostName string   `json:"hostname"` // Host machine DNS name
 	Port     int      `json:"port"`     // Service Port
+	Priority uint16   `json:"priority"` // SRV priority: lower is more preferred
+	Weight   uint16   `json:"weight"`   // SRV weight: higher is more preferred among equal priorities
 	Text     []string `json:"text"`     // Service info served as a TXT record
-	TTL      uint32   `json:"ttl"`      // TTL of the service record
+	TTL      uint32   `json:"ttl"`      // TTL of the SRV record; of the PTR/TXT record when the answer carried no SRV
 	AddrIPv4 []net.IP `json:"-"`        // Host machine IPv4 address
 	AddrIPv6 []net.IP `json:"-"`        // Host machine IPv6 address
+}
+
+// WatchEvent is one change reported by Resolver.Watch.
+type WatchEvent struct {
+	// Entry is the merged view of the instance when Removed is false. When
+	// Removed is true it only identifies the instance that said goodbye.
+	Entry *ServiceEntry
+	// Removed: a goodbye (PTR or SRV record with TTL 0) was received for an
+	// instance that had been reported before.
+	Removed bool
 }
 
 // NewServiceEntry constructs a ServiceEntry.
