@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 )
 
 // ServiceRecord contains the basic description of a service, which contains instance name, service type & domain
@@ -69,10 +70,15 @@ func NewServiceRecord(instance, service string, domain string) *ServiceRecord {
 type lookupParams struct {
 	ServiceRecord
 	Entries chan<- *ServiceEntry // Entries Channel
-	// Removed, when set, receives every service instance for which a goodbye
-	// record (TTL 0) arrives while browsing. Nil keeps the old behaviour: the
-	// instance is dropped silently.
-	Removed chan<- *ServiceEntry
+
+	// Watch mode (Resolver.Watch). watch makes the receive loop hand over
+	// every answer of an instance, not only the first one, so the subscriber
+	// can refresh what it knows; Removed receives the instances for which a
+	// goodbye record (TTL 0) arrives; queryInterval is the fixed interval at
+	// which the query is repeated for as long as the context lives.
+	watch         bool
+	Removed       chan<- *ServiceEntry
+	queryInterval time.Duration
 
 	isBrowsing  bool
 	stopProbing chan struct{}
@@ -112,7 +118,7 @@ type ServiceEntry struct {
 	Priority uint16   `json:"priority"` // SRV priority: lower is more preferred
 	Weight   uint16   `json:"weight"`   // SRV weight: higher is more preferred among equal priorities
 	Text     []string `json:"text"`     // Service info served as a TXT record
-	TTL      uint32   `json:"ttl"`      // TTL of the service record
+	TTL      uint32   `json:"ttl"`      // TTL of the SRV record; of the PTR/TXT record when the answer carried no SRV
 	AddrIPv4 []net.IP `json:"-"`        // Host machine IPv4 address
 	AddrIPv6 []net.IP `json:"-"`        // Host machine IPv6 address
 }

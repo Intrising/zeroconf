@@ -107,29 +107,39 @@ func (r *Resolver) Browse(ctx context.Context, service, domain string, entries c
 	return nil
 }
 
-// BrowseWithRemoved works like Browse and additionally reports, on removed,
-// every instance of the service for which a goodbye record (TTL 0) is
-// received. The reported entry carries the instance name; its other fields
-// are only what the goodbye packet contained. removed is never closed; the
-// caller stops reading it once entries has been closed.
-func (r *Resolver) BrowseWithRemoved(ctx context.Context, service, domain string, entries chan<- *ServiceEntry, removed chan<- *ServiceEntry) error {
+// Watch keeps a browse of a service open for as long as ctx lives.
+//
+// Unlike Browse it reports every answer of an instance on updates, not only
+// the first one, so the subscriber can refresh the lifetime, address and SRV
+// priority/weight it holds for that instance; it reports on removed every
+// instance for which a goodbye record (TTL 0) is received; and it repeats the
+// query every interval without ever giving up (Browse backs off and stops).
+//
+// updates is closed when the watch ends: when ctx is done, when the query can
+// no longer be sent, or when every receive socket has failed. removed is never
+// closed; stop reading it once updates has been closed.
+func (r *Resolver) Watch(ctx context.Context, service, domain string, interval time.Duration, updates chan<- *ServiceEntry, removed chan<- *ServiceEntry) error {
+	if interval <= 0 {
+		return fmt.Errorf("zeroconf: watch interval must be positive")
+	}
 	params := defaultParams(service)
 	if domain != "" {
 		params.Domain = domain
 	}
-	params.Entries = entries
+	params.Entries = updates
 	params.Removed = removed
 	params.isBrowsing = true
+	params.watch = true
+	params.queryInterval = interval
 	ctx, cancel := context.WithCancel(ctx)
 	go r.c.mainloop(ctx, params)
 
-	err := r.c.query(params)
-	if err != nil {
+	if err := r.c.query(params); err != nil {
 		cancel()
 		return err
 	}
 	go func() {
-		if err := r.c.periodicQuery(ctx, params); err != nil {
+		if err := r.c.watchQuery(ctx, params); err != nil {
 			cancel()
 		}
 	}()
@@ -213,18 +223,27 @@ func newClient(opts clientOpts) (*client, error) {
 func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 	// start listening for responses
 	msgCh := make(chan *dns.Msg, 32)
+	// A receiver reports here when it stops. Once none is left the loop can
+	// no longer learn anything, so it ends and closes the entries channel
+	// instead of leaving the subscriber waiting on a dead socket.
+	recvExit := make(chan struct{}, 2)
+	receivers := 0
 	if c.ipv4conn != nil {
+		receivers++
 		c.recvWg.Add(1)
 		go func() {
 			defer c.recvWg.Done()
 			c.recv(ctx, c.ipv4conn, msgCh)
+			recvExit <- struct{}{}
 		}()
 	}
 	if c.ipv6conn != nil {
+		receivers++
 		c.recvWg.Add(1)
 		go func() {
 			defer c.recvWg.Done()
 			c.recv(ctx, c.ipv6conn, msgCh)
+			recvExit <- struct{}{}
 		}()
 	}
 
@@ -238,77 +257,16 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 			params.done()
 			c.shutdown()
 			return
+		case <-recvExit:
+			receivers--
+			if receivers > 0 {
+				continue
+			}
+			params.done()
+			c.shutdown()
+			return
 		case msg := <-msgCh:
-			entries = make(map[string]*ServiceEntry)
-			sections := append(msg.Answer, msg.Ns...)
-			sections = append(sections, msg.Extra...)
-
-			for _, answer := range sections {
-				switch rr := answer.(type) {
-				case *dns.PTR:
-					if params.ServiceName() != rr.Hdr.Name {
-						continue
-					}
-					if params.ServiceInstanceName() != "" && params.ServiceInstanceName() != rr.Ptr {
-						continue
-					}
-					if _, ok := entries[rr.Ptr]; !ok {
-						entries[rr.Ptr] = NewServiceEntry(
-							trimDot(strings.Replace(rr.Ptr, rr.Hdr.Name, "", -1)),
-							params.Service,
-							params.Domain)
-					}
-					entries[rr.Ptr].TTL = rr.Hdr.Ttl
-				case *dns.SRV:
-					if params.ServiceInstanceName() != "" && params.ServiceInstanceName() != rr.Hdr.Name {
-						continue
-					} else if !strings.HasSuffix(rr.Hdr.Name, params.ServiceName()) {
-						continue
-					}
-					if _, ok := entries[rr.Hdr.Name]; !ok {
-						entries[rr.Hdr.Name] = NewServiceEntry(
-							trimDot(strings.Replace(rr.Hdr.Name, params.ServiceName(), "", 1)),
-							params.Service,
-							params.Domain)
-					}
-					entries[rr.Hdr.Name].HostName = rr.Target
-					entries[rr.Hdr.Name].Port = int(rr.Port)
-					entries[rr.Hdr.Name].Priority = rr.Priority
-					entries[rr.Hdr.Name].Weight = rr.Weight
-					entries[rr.Hdr.Name].TTL = rr.Hdr.Ttl
-				case *dns.TXT:
-					if params.ServiceInstanceName() != "" && params.ServiceInstanceName() != rr.Hdr.Name {
-						continue
-					} else if !strings.HasSuffix(rr.Hdr.Name, params.ServiceName()) {
-						continue
-					}
-					if _, ok := entries[rr.Hdr.Name]; !ok {
-						entries[rr.Hdr.Name] = NewServiceEntry(
-							trimDot(strings.Replace(rr.Hdr.Name, params.ServiceName(), "", 1)),
-							params.Service,
-							params.Domain)
-					}
-					entries[rr.Hdr.Name].Text = rr.Txt
-					entries[rr.Hdr.Name].TTL = rr.Hdr.Ttl
-				}
-			}
-			// Associate IPs in a second round as other fields should be filled by now.
-			for _, answer := range sections {
-				switch rr := answer.(type) {
-				case *dns.A:
-					for k, e := range entries {
-						if e.HostName == rr.Hdr.Name {
-							entries[k].AddrIPv4 = append(entries[k].AddrIPv4, rr.A)
-						}
-					}
-				case *dns.AAAA:
-					for k, e := range entries {
-						if e.HostName == rr.Hdr.Name {
-							entries[k].AddrIPv6 = append(entries[k].AddrIPv6, rr.AAAA)
-						}
-					}
-				}
-			}
+			entries = parseAnswers(msg, params)
 		}
 
 		if len(entries) > 0 {
@@ -326,7 +284,7 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 					}
 					continue
 				}
-				if _, ok := sentEntries[k]; ok {
+				if _, ok := sentEntries[k]; ok && !params.watch {
 					continue
 				}
 
@@ -342,7 +300,14 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 				// Submit entry to subscriber and cache it.
 				// This is also a point to possibly stop probing actively for a
 				// service entry.
-				params.Entries <- e
+				if params.watch {
+					select {
+					case params.Entries <- e:
+					case <-ctx.Done():
+					}
+				} else {
+					params.Entries <- e
+				}
 				sentEntries[k] = e
 				if !params.isBrowsing {
 					params.disableProbing()
@@ -350,6 +315,92 @@ func (c *client) mainloop(ctx context.Context, params *lookupParams) {
 			}
 		}
 	}
+}
+
+// parseAnswers builds the service entries carried by one mDNS message.
+//
+// An entry's TTL is the TTL of its SRV record. PTR and TXT records of the same
+// instance often carry a different (longer) TTL; they only set the entry's TTL
+// when the message has no SRV record for it, so that a subscriber that expires
+// instances by TTL does not keep one for the lifetime of its TXT record.
+func parseAnswers(msg *dns.Msg, params *lookupParams) map[string]*ServiceEntry {
+	entries := make(map[string]*ServiceEntry)
+	srvTTL := make(map[string]bool) // entries whose TTL comes from an SRV record
+	sections := append(msg.Answer, msg.Ns...)
+	sections = append(sections, msg.Extra...)
+
+	for _, answer := range sections {
+		switch rr := answer.(type) {
+		case *dns.PTR:
+			if params.ServiceName() != rr.Hdr.Name {
+				continue
+			}
+			if params.ServiceInstanceName() != "" && params.ServiceInstanceName() != rr.Ptr {
+				continue
+			}
+			if _, ok := entries[rr.Ptr]; !ok {
+				entries[rr.Ptr] = NewServiceEntry(
+					trimDot(strings.Replace(rr.Ptr, rr.Hdr.Name, "", -1)),
+					params.Service,
+					params.Domain)
+			}
+			if !srvTTL[rr.Ptr] {
+				entries[rr.Ptr].TTL = rr.Hdr.Ttl
+			}
+		case *dns.SRV:
+			if params.ServiceInstanceName() != "" && params.ServiceInstanceName() != rr.Hdr.Name {
+				continue
+			} else if !strings.HasSuffix(rr.Hdr.Name, params.ServiceName()) {
+				continue
+			}
+			if _, ok := entries[rr.Hdr.Name]; !ok {
+				entries[rr.Hdr.Name] = NewServiceEntry(
+					trimDot(strings.Replace(rr.Hdr.Name, params.ServiceName(), "", 1)),
+					params.Service,
+					params.Domain)
+			}
+			entries[rr.Hdr.Name].HostName = rr.Target
+			entries[rr.Hdr.Name].Port = int(rr.Port)
+			entries[rr.Hdr.Name].Priority = rr.Priority
+			entries[rr.Hdr.Name].Weight = rr.Weight
+			entries[rr.Hdr.Name].TTL = rr.Hdr.Ttl
+			srvTTL[rr.Hdr.Name] = true
+		case *dns.TXT:
+			if params.ServiceInstanceName() != "" && params.ServiceInstanceName() != rr.Hdr.Name {
+				continue
+			} else if !strings.HasSuffix(rr.Hdr.Name, params.ServiceName()) {
+				continue
+			}
+			if _, ok := entries[rr.Hdr.Name]; !ok {
+				entries[rr.Hdr.Name] = NewServiceEntry(
+					trimDot(strings.Replace(rr.Hdr.Name, params.ServiceName(), "", 1)),
+					params.Service,
+					params.Domain)
+			}
+			entries[rr.Hdr.Name].Text = rr.Txt
+			if !srvTTL[rr.Hdr.Name] {
+				entries[rr.Hdr.Name].TTL = rr.Hdr.Ttl
+			}
+		}
+	}
+	// Associate IPs in a second round as other fields should be filled by now.
+	for _, answer := range sections {
+		switch rr := answer.(type) {
+		case *dns.A:
+			for k, e := range entries {
+				if e.HostName == rr.Hdr.Name {
+					entries[k].AddrIPv4 = append(entries[k].AddrIPv4, rr.A)
+				}
+			}
+		case *dns.AAAA:
+			for k, e := range entries {
+				if e.HostName == rr.Hdr.Name {
+					entries[k].AddrIPv6 = append(entries[k].AddrIPv6, rr.AAAA)
+				}
+			}
+		}
+	}
+	return entries
 }
 
 // Shutdown client will close currently open connections and channel implicitly.
@@ -455,6 +506,24 @@ func (c *client) periodicQuery(ctx context.Context, params *lookupParams) error 
 			return ctx.Err()
 		}
 		// Do periodic query.
+		if err := c.query(params); err != nil {
+			return err
+		}
+	}
+}
+
+// watchQuery repeats the query every params.queryInterval until ctx is done.
+// It returns an error when the query can no longer be sent; the caller then
+// ends the watch.
+func (c *client) watchQuery(ctx context.Context, params *lookupParams) error {
+	ticker := time.NewTicker(params.queryInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+		case <-ctx.Done():
+			return nil
+		}
 		if err := c.query(params); err != nil {
 			return err
 		}
